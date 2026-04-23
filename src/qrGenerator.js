@@ -173,27 +173,57 @@ function warmupBrowser() {
 }
 
 // ============================================================
-//  Page pool — keep 3 tabs pre-navigated to the Bhutan site
+//  Page pool — keep 1 tab pre-navigated to the Bhutan site
 //  so every QR request grabs a ready page instantly.
-//  After use, the page is closed and a fresh one is warmed up.
+//  After use, the page is closed and cookies/cache/storage cleared
+//  before a fresh one is prepared.
 // ============================================================
-// Pool size: can be overridden via env var. Default 3.
-// Each pooled page uses ~80-120 MB of Chromium memory.
-// On Railway $5 plan (512 MB RAM), 3 pages is safe. Set POOL_SIZE=1 for low-memory.
-const POOL_SIZE = parseInt(process.env.POOL_SIZE || "3", 10);
+// Pool size: 1 is the sweet spot — fast first request, low memory.
+// Override with POOL_SIZE=2 env var if you have RAM to spare.
+const POOL_SIZE = parseInt(process.env.POOL_SIZE || "1", 10);
 const BHUTAN_URL = "https://bms.immi.gov.bt/registration/foreigner";
 const _pagePool = [];   // { page, readyAt }
 let _poolFilling = false;
+let _requestCounter = 0;  // for tracing logs
+
+// Clear ALL browser-level state: cookies, cache, service workers, storage.
+// This runs BEFORE preparing a new page so each pooled page starts fresh —
+// no stale sessions, no CSRF token reuse, no cookie buildup.
+async function clearBrowserState(browser) {
+  try {
+    const client = await (await browser.pages())[0].target().createCDPSession();
+    await client.send("Network.clearBrowserCookies").catch(() => {});
+    await client.send("Network.clearBrowserCache").catch(() => {});
+    await client.send("Storage.clearDataForOrigin", {
+      origin: "https://bms.immi.gov.bt",
+      storageTypes: "all",
+    }).catch(() => {});
+    await client.detach().catch(() => {});
+    console.log("🧹 Browser state cleared (cookies, cache, storage)");
+  } catch (e) {
+    console.log(`  (couldn't clear state: ${e.message})`);
+  }
+}
 
 // Prepare a single page: open tab, navigate, wait for form, set up resource blocking
 async function prepareNewPage() {
   const browser = await getBrowser();
+
+  // Clear any existing state from previous sessions
+  await clearBrowserState(browser);
+
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
   await page.setDefaultNavigationTimeout(25000);
   await page.setDefaultTimeout(15000);
 
-  // Block heavy resources (fonts, non-QR images) for faster loads
+  // Also clear THIS page's cookies/storage as a double-safety
+  try {
+    const cookies = await page.cookies();
+    if (cookies.length) await page.deleteCookie(...cookies);
+  } catch {}
+
+  // Block heavy resources (fonts, non-QR images) for faster loads.
   // Wrap every handler in try/catch — one bad continue() call hangs the whole page
   try {
     await page.setRequestInterception(true);
@@ -207,7 +237,6 @@ async function prepareNewPage() {
         }
         req.continue().catch(() => {});
       } catch {
-        // If interception state is weird, just let the request through
         try { req.continue(); } catch {}
       }
     });
@@ -303,12 +332,50 @@ async function acquirePage() {
 }
 
 // ============================================================
-//  Main generate function
-//  Pass { debug: true } to get step-by-step screenshots
+//  Main generate function (public API)
+//  Wraps the inner logic with an overall 90s timeout so we never
+//  hang forever. If it times out, we return an error instead of
+//  leaving the user staring at "GENERATING QR..." indefinitely.
 // ============================================================
-async function generate({ vehicleNumber, type, port, driverid, passengers = [], date, debug = false }) {
+async function generate(opts) {
+  const OVERALL_TIMEOUT_MS = 90_000; // 90 seconds max for entire flow
+  let timedOut = false;
+  const timeoutPromise = new Promise((_, rej) => {
+    setTimeout(() => {
+      timedOut = true;
+      rej(new Error("QR generation timed out after 90 seconds — site may be down"));
+    }, OVERALL_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([_generateInner(opts), timeoutPromise]);
+  } catch (err) {
+    if (timedOut) {
+      console.error("⏱️  Overall timeout hit — aborting and recycling pool");
+      // Flush the pool — any stuck pages need to be killed
+      while (_pagePool.length) {
+        const entry = _pagePool.shift();
+        entry.page.close().catch(() => {});
+      }
+      // Start a fresh pool fill
+      setImmediate(() => fillPagePool());
+    }
+    throw err;
+  }
+}
+
+async function _generateInner({ vehicleNumber, type, port, driverid, passengers = [], date, debug = false }) {
+  const reqId = ++_requestCounter;
+  const tag = `[QR#${reqId}]`;
+  const startedAt = Date.now();
+  const logStep = (label) => {
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+    console.log(`${tag} [+${elapsed}s] ${label}`);
+  };
+
+  logStep("Acquiring page from pool...");
   // Grab a pre-navigated page from the pool (instant if one is ready)
   const page = await acquirePage();
+  logStep("✓ Page acquired");
 
   // Collect step screenshots for debug mode
   const stepScreenshots = [];
@@ -320,9 +387,9 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     try {
       await page.screenshot({ path: filePath, fullPage: true });
       stepScreenshots.push({ label, path: filePath });
-      console.log(`  📸 ${label}`);
+      console.log(`${tag}  📸 ${label}`);
     } catch (e) {
-      console.log(`  (screenshot failed for ${label})`);
+      console.log(`${tag}  (screenshot failed for ${label})`);
     }
   }
 
@@ -335,7 +402,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     await shot("1_opened");
 
     // ── STEP 1: Port ──────────────────────────────────────
-    console.log(`→ Port: ${portName}`);
+    logStep(`Step 1/7: Selecting port "${portName}"`);
     const portOk = await selectFromDropdown(page, "port of entry", portName);
     await waitForDropdownClosed(page, 2000);
     await shot("1a_port_selected");
@@ -384,14 +451,14 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     } catch {}
 
     // ── STEP 1: Vehicle Type ──────────────────────────────
-    console.log(`→ Vehicle type: ${typeName}`);
+    logStep(`Step 2/7: Selecting vehicle type "${typeName}"`);
     const typeOk = await selectFromDropdown(page, "vehicle type", typeName);
     await waitForDropdownClosed(page, 2000);
     await shot("1b_type_selected");
     if (!typeOk) console.log("⚠️ Vehicle type selection may have failed");
 
     // ── STEP 1: Vehicle Number ────────────────────────────
-    console.log(`→ Vehicle number: ${vehicleNumber}`);
+    logStep(`Step 3/7: Typing vehicle number "${vehicleNumber}"`);
     const vInput = await page.$("input[placeholder*='vehicle number' i], input[placeholder*='Enter vehicle' i]");
     if (vInput) {
       await vInput.click({ clickCount: 3 });
@@ -428,7 +495,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     await shot("3_step2_opened");
 
     // ── STEP 2: Driver ID + Search ────────────────────────
-    console.log(`→ Driver ID: ${driverid}`);
+    logStep(`Step 4/7: Entering driver ID "${driverid}"`);
     // Select Bhutanese nationality if dropdown exists
     await selectFromDropdown(page, "nationality", "Bhutanese").catch(() => {});
     await wait(250);
@@ -466,7 +533,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     // Detect "not registered"
     const pageText = (await page.evaluate(() => document.body.innerText)).toLowerCase();
     if (/not\s*registered|not\s*found|please\s*register|no\s*record|invalid/.test(pageText)) {
-      console.log("✗ ID not registered");
+      logStep("❌ ID not registered in database — aborting");
       await page.close().catch(() => {});
       return { notRegistered: true, stepScreenshots };
     }
@@ -479,7 +546,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
       );
       if (vals.length) driverName = vals[0];
     } catch {}
-    console.log(`→ Driver name: ${driverName || '(not extracted)'}`);
+    logStep(`Step 4.5/7: Driver name fetched: ${driverName || '(not found)'}`);
 
     await clickButtonText(page, ["Next"]);
     // Wait for passenger page OR declaration page (both are step 3 variations)
@@ -499,7 +566,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     // ── STEP 3: Add passengers (optional) ─────────────────
     if (passengers && passengers.length) {
       for (const p of passengers) {
-        console.log(`→ Adding passenger: ${p.docNumber}`);
+        logStep(`Step 5/7: Adding passenger "${p.docNumber}"`);
 
         // Click "Search & Add Passenger" first to open the add-passenger modal/form
         await clickButtonText(page, ["Search & Add Passenger", "Add Passenger"]);
@@ -625,7 +692,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
       if (boxes.length && !boxes[0].checked) { boxes[0].click(); return true; }
       return false;
     });
-    console.log(`→ Declaration ticked: ${tickedOk}`);
+    logStep(`Step 6/7: Declaration checkbox ticked: ${tickedOk}`);
     // Wait until the checkbox is visually checked (React state updated)
     await waitFor(page, () => {
       const boxes = Array.from(document.querySelectorAll("input[type='checkbox']"));
@@ -634,7 +701,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     await shot("8_declaration_ticked");
 
     // ── Click Next → this submits and moves to STEP 4 (QR) ──
-    console.log("→ Clicking Next (submits form)...");
+    logStep("Step 7/7: Submitting final form...");
     const clickedNext = await clickButtonText(page, ["Next", "NEXT", "Submit", "Submit Form"]);
     if (!clickedNext) {
       const allButtons = await page.evaluate(() => {
@@ -646,7 +713,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     await shot("9_step4_after_submit");
 
     // ── Capture QR — wait for it to actually appear ────────
-    console.log("→ Waiting for QR code to appear...");
+    logStep("Waiting for QR code from server...");
     await page.waitForSelector(
       "img[alt*='qr' i], img[src*='data:image'], img[src*='qr'], canvas",
       { timeout: 25000 }
@@ -691,7 +758,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     }
 
     await page.close().catch(() => {});
-    console.log(`✓ QR saved: ${qrFilePath}`);
+    logStep(`✅ QR complete! Saved to ${path.basename(qrFilePath)}`);
 
     return {
       qrImagePath: qrFilePath,
