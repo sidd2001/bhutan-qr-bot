@@ -704,16 +704,38 @@ async function runPreset(ctx, num, passengers, testMode) {
 
   await ctx.reply(generatingCard, { parse_mode: "Markdown" });
 
+  // Send periodic progress updates so user isn't left wondering
+  let progressMsgId = null;
+  const progressInterval = setInterval(async () => {
+    try {
+      if (progressMsgId) {
+        await ctx.telegram.deleteMessage(ctx.chat.id, progressMsgId).catch(() => {});
+      }
+      const m = await ctx.reply("⏳ _Still working..._", { parse_mode: "Markdown" });
+      progressMsgId = m.message_id;
+    } catch {}
+  }, 20000); // every 20 seconds
+
   try {
-    const result = await QRGenerator.generate({
-      vehicleNumber: preset.vehicle,
-      type: preset.type,
-      port: preset.port,
-      driverid: preset.driverid,
-      passengers,
-      date: new Date().toISOString().split("T")[0],
-      debug: testMode,
-    });
+    // Hard timeout — if QR takes more than 90 seconds, abort and tell user
+    const result = await Promise.race([
+      QRGenerator.generate({
+        vehicleNumber: preset.vehicle,
+        type: preset.type,
+        port: preset.port,
+        driverid: preset.driverid,
+        passengers,
+        date: new Date().toISOString().split("T")[0],
+        debug: testMode,
+      }),
+      new Promise((_, rej) => setTimeout(() =>
+        rej(new Error("QR generation timed out after 90 seconds. Immigration site may be slow or down.")),
+        90000
+      )),
+    ]);
+
+    clearInterval(progressInterval);
+    if (progressMsgId) await ctx.telegram.deleteMessage(ctx.chat.id, progressMsgId).catch(() => {});
 
     if (testMode && result.stepScreenshots?.length) {
       for (const s of result.stepScreenshots) {
@@ -819,6 +841,9 @@ async function runPreset(ctx, num, passengers, testMode) {
       }
     }
   } catch (e) {
+    clearInterval(progressInterval);
+    if (progressMsgId) await ctx.telegram.deleteMessage(ctx.chat.id, progressMsgId).catch(() => {});
+
     if (testMode && e.stepScreenshots?.length) {
       for (const s of e.stepScreenshots) {
         try { await ctx.replyWithPhoto({ source: s.path }, { caption: `🧪 ${s.label.replace(/_/g, " ")}` }); } catch {}

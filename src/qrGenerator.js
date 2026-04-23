@@ -190,26 +190,46 @@ async function prepareNewPage() {
   const browser = await getBrowser();
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
+  await page.setDefaultNavigationTimeout(25000);
+  await page.setDefaultTimeout(15000);
 
   // Block heavy resources (fonts, non-QR images) for faster loads
-  await page.setRequestInterception(true);
-  page.on("request", req => {
-    const rtype = req.resourceType();
-    const url = req.url();
-    if (rtype === "font" || rtype === "media") return req.abort();
-    if (rtype === "image" && !url.includes("qr") && !url.includes("data:image")) return req.abort();
-    req.continue();
-  });
+  // Wrap every handler in try/catch — one bad continue() call hangs the whole page
+  try {
+    await page.setRequestInterception(true);
+    page.on("request", req => {
+      try {
+        const rtype = req.resourceType();
+        const url = req.url();
+        if (rtype === "font" || rtype === "media") return req.abort().catch(() => {});
+        if (rtype === "image" && !url.includes("qr") && !url.includes("data:image")) {
+          return req.abort().catch(() => {});
+        }
+        req.continue().catch(() => {});
+      } catch {
+        // If interception state is weird, just let the request through
+        try { req.continue(); } catch {}
+      }
+    });
+  } catch (e) {
+    console.log(`⚠️ Could not set request interception: ${e.message} — continuing without it`);
+  }
 
   // Navigate to Bhutan site and wait for form ready
-  await page.goto(BHUTAN_URL, {
-    waitUntil: "domcontentloaded",
-    timeout: 30000,
-  });
+  try {
+    await page.goto(BHUTAN_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 25000,
+    });
+  } catch (e) {
+    console.log(`⚠️ page.goto failed: ${e.message}`);
+    return { page, ready: false };
+  }
+
   const ready = await waitFor(page, () => {
     const t = document.body.innerText.toLowerCase();
     return t.includes("port of entry") || t.includes("select the port");
-  }, 15000, 150);
+  }, 12000, 150);
 
   return { page, ready };
 }
@@ -250,28 +270,34 @@ async function acquirePage() {
     const entry = _pagePool.shift();
     const age = Date.now() - entry.readyAt;
     if (age > TTL_MS) {
-      // Too old — session might have expired
       console.log(`♻️ Discarding stale pooled page (age ${Math.round(age/1000)}s)`);
       entry.page.close().catch(() => {});
       continue;
     }
-    // Verify page is still usable
+    // Verify page is still usable (with a timeout — don't hang if page is zombie)
     try {
-      await entry.page.evaluate(() => document.title);
+      await Promise.race([
+        entry.page.evaluate(() => document.title),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("page check timeout")), 2000)),
+      ]);
       console.log(`⚡ Using pooled page (${_pagePool.length} still ready)`);
-      // Start refilling in background (don't await)
       setImmediate(() => fillPagePool());
       return entry.page;
-    } catch {
-      console.log("⚠️ Pooled page dead, discarding");
+    } catch (e) {
+      console.log(`⚠️ Pooled page dead (${e.message}), discarding`);
       entry.page.close().catch(() => {});
     }
   }
 
-  // Pool empty — prepare a fresh page synchronously
+  // Pool empty — prepare a fresh page synchronously (with timeout safety)
   console.log("⏳ Pool empty, preparing fresh page...");
-  const { page } = await prepareNewPage();
-  // Start refilling in background
+  const { page, ready } = await Promise.race([
+    prepareNewPage(),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("fresh page preparation timed out after 30s")), 30000)),
+  ]);
+  if (!ready) {
+    console.log("⚠️ Fresh page didn't load form properly — proceeding anyway");
+  }
   setImmediate(() => fillPagePool());
   return page;
 }
