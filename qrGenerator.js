@@ -121,12 +121,16 @@ async function getBrowser() {
       if (pages.length >= 0) return _browserInstance;
     } catch {
       // Browser crashed — fall through to relaunch
+      console.log("⚠️ Existing browser is dead, relaunching...");
       _browserInstance = null;
       _browserPromise = null;
     }
   }
 
-  if (_browserPromise) return _browserPromise;
+  if (_browserPromise) {
+    console.log("⏳ Browser launch already in progress, awaiting...");
+    return _browserPromise;
+  }
 
   const launchOpts = {
     headless: true,
@@ -139,16 +143,22 @@ async function getBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
     ],
+    // Hard timeout on launch — if it takes more than 30s, something is wrong
+    timeout: 30000,
   };
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    console.log(`🚀 Launching Chromium from ${launchOpts.executablePath}...`);
+  } else {
+    console.log("🚀 Launching Chromium (bundled)...");
   }
 
-  console.log("🚀 Launching Chromium (one-time startup)...");
+  const launchStart = Date.now();
   _browserPromise = puppeteer.launch(launchOpts).then(b => {
+    const elapsed = ((Date.now() - launchStart) / 1000).toFixed(1);
+    console.log(`✅ Chromium launched in ${elapsed}s`);
     _browserInstance = b;
     _browserPromise = null;
-    // If browser crashes, clear our reference so next call relaunches
     b.on("disconnected", () => {
       console.log("⚠️ Browser disconnected — will relaunch on next request");
       _browserInstance = null;
@@ -156,6 +166,8 @@ async function getBrowser() {
     });
     return b;
   }).catch(err => {
+    const elapsed = ((Date.now() - launchStart) / 1000).toFixed(1);
+    console.log(`❌ Chromium launch FAILED after ${elapsed}s: ${err.message}`);
     _browserPromise = null;
     throw err;
   });
@@ -165,12 +177,22 @@ async function getBrowser() {
 
 // Warm up the browser on module load (so first QR is fast too)
 function warmupBrowser() {
-  getBrowser().catch(err => {
+  console.log("🔥 Browser warmup triggered");
+  getBrowser().then(() => {
+    console.log("✅ Chromium ready, starting pool fill...");
+    fillPagePool();
+  }).catch(err => {
     console.log("⚠️ Browser warmup failed (will retry on first request):", err.message);
   });
-  // Also start warming the page pool
-  setTimeout(() => fillPagePool(), 2000);
 }
+
+// ⚡ AUTO-WARMUP: As soon as this module is loaded, start launching Chromium
+// and warming the page pool. This means by the time a user sends their first
+// QR request, the browser+page is already ready.
+setImmediate(() => {
+  console.log("🚀 Module loaded — auto-warming browser & page pool...");
+  warmupBrowser();
+});
 
 // ============================================================
 //  Page pool — keep 1 tab pre-navigated to the Bhutan site
@@ -271,19 +293,25 @@ async function fillPagePool() {
     while (_pagePool.length < POOL_SIZE) {
       try {
         console.log(`🏊 Warming page ${_pagePool.length + 1}/${POOL_SIZE}...`);
-        const { page, ready } = await prepareNewPage();
+        // Cap each page preparation at 40s — if the Bhutan site is slow/down,
+        // we don't want to block forever
+        const result = await Promise.race([
+          prepareNewPage(),
+          new Promise((_, rej) => setTimeout(() =>
+            rej(new Error("pool page preparation timed out after 40s")), 40000)),
+        ]);
+        const { page, ready } = result;
         if (ready) {
           _pagePool.push({ page, readyAt: Date.now() });
           console.log(`✅ Page pool: ${_pagePool.length}/${POOL_SIZE} ready`);
         } else {
           console.log("⚠️ Page didn't load properly, closing");
           await page.close().catch(() => {});
-          // Don't retry immediately — back off to avoid hammering the site
-          await wait(3000);
+          await wait(5000); // back off before retry
         }
       } catch (e) {
-        console.log(`⚠️ Pool fill error: ${e.message}`);
-        await wait(3000);
+        console.log(`⚠️ Pool fill error: ${e.message} — will retry in 5s`);
+        await wait(5000);
       }
     }
   } finally {
@@ -338,7 +366,7 @@ async function acquirePage() {
 //  leaving the user staring at "GENERATING QR..." indefinitely.
 // ============================================================
 async function generate(opts) {
-  const OVERALL_TIMEOUT_MS = 90_000; // 90 seconds max for entire flow
+  const OVERALL_TIMEOUT_MS = 60_000; // 60 seconds — gives us margin before Telegraf's 90s timeout
   let timedOut = false;
   const timeoutPromise = new Promise((_, rej) => {
     setTimeout(() => {
@@ -459,38 +487,76 @@ async function _generateInner({ vehicleNumber, type, port, driverid, passengers 
 
     // ── STEP 1: Vehicle Number ────────────────────────────
     logStep(`Step 3/7: Typing vehicle number "${vehicleNumber}"`);
-    const vInput = await page.$("input[placeholder*='vehicle number' i], input[placeholder*='Enter vehicle' i]");
-    if (vInput) {
-      await vInput.click({ clickCount: 3 });
-      await vInput.type(vehicleNumber, { delay: 50 });
-    } else {
-      // fallback: any text input near the vehicle label
-      const inputs = await page.$$("input[type='text']");
-      if (inputs.length) {
-        await inputs[inputs.length - 1].click({ clickCount: 3 });
-        await inputs[inputs.length - 1].type(vehicleNumber, { delay: 50 });
-      } else {
-        throw new Error("Could not find Vehicle Number input on Step 1");
-      }
+
+    // Use a wrapped approach that CAN'T hang — if Puppeteer's click/type gets stuck
+    // waiting for the input to be "ready", we fall back to JS value-set + dispatch
+    const vehicleFilled = await Promise.race([
+      fillInputSafely(page, vehicleNumber, ["vehicle number", "enter vehicle"]),
+      new Promise(resolve => setTimeout(() => resolve("timeout"), 8000)),
+    ]);
+
+    if (vehicleFilled === "timeout") {
+      logStep("⚠️ Vehicle number input hung — using JS fallback");
+      const jsFilled = await page.evaluate((num) => {
+        // Find vehicle number input by placeholder or position
+        const inputs = Array.from(document.querySelectorAll("input[type='text'], input:not([type])"));
+        // Prefer one with 'vehicle' in placeholder
+        let target = inputs.find(i => {
+          const ph = (i.placeholder || "").toLowerCase();
+          return ph.includes("vehicle") && !ph.includes("type");
+        });
+        // Fallback: the last text input on page
+        if (!target && inputs.length) target = inputs[inputs.length - 1];
+        if (!target) return false;
+
+        // React-compatible value setter
+        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeSetter.call(target, num);
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }, vehicleNumber);
+      if (!jsFilled) throw new Error("Could not find Vehicle Number input on Step 1");
+    } else if (vehicleFilled === false) {
+      throw new Error("Could not find Vehicle Number input on Step 1");
     }
+
     await wait(200);
     await shot("2_vehicle_filled");
 
+    // Before clicking Next, quickly verify step 1 is actually filled
+    // If port or type weren't selected, Next won't work and we'll hang
+    logStep("Clicking Next → Step 2...");
     await clickButtonText(page, ["Next"]);
-    // Wait for Step 2 (Driver Details) to appear instead of blind delays
-    const step2Loaded = await waitForText(page, "driver details", 8000) ||
-                        await waitForText(page, "driver id", 3000) ||
-                        await waitForText(page, "nationality", 3000);
-    if (!step2Loaded) console.log("⚠️ Step 2 may not have loaded — trying Next again");
 
-    // Sometimes the site needs a second Next click — but only if still on Step 1
-    const stillOnStep1 = await page.evaluate(() => {
-      return document.body.innerText.toLowerCase().includes("vehicle number") &&
-             !document.body.innerText.toLowerCase().includes("driver details");
-    });
-    if (stillOnStep1) {
+    // Wait for Step 2 (Driver Details) to appear — with aggressive timeout
+    // If port/type was missed, Next won't work; detect that quickly instead of hanging
+    const step2Loaded = await waitFor(page, () => {
+      const t = document.body.innerText.toLowerCase();
+      return t.includes("driver details") || t.includes("driver id") ||
+             t.includes("nationality");
+    }, 6000, 200);
+
+    if (!step2Loaded) {
+      // Didn't advance — port or vehicle type likely wasn't selected
+      // Check for validation errors
+      const hasError = await page.evaluate(() => {
+        const t = document.body.innerText.toLowerCase();
+        return t.includes("required") || t.includes("select") && t.includes("port");
+      });
+      if (hasError) {
+        throw new Error("Form validation failed — port or vehicle type not selected. Retry may help.");
+      }
+      // Try one more Next click
+      logStep("Step 2 didn't load, retrying Next...");
       await clickButtonText(page, ["Next"]);
-      await waitForText(page, "driver details", 5000);
+      const retry = await waitFor(page, () => {
+        const t = document.body.innerText.toLowerCase();
+        return t.includes("driver details") || t.includes("driver id");
+      }, 4000, 200);
+      if (!retry) {
+        throw new Error("Could not advance to Driver Details (Step 2). Form likely incomplete.");
+      }
     }
     await shot("3_step2_opened");
 
@@ -500,11 +566,33 @@ async function _generateInner({ vehicleNumber, type, port, driverid, passengers 
     await selectFromDropdown(page, "nationality", "Bhutanese").catch(() => {});
     await wait(250);
 
-    const idInputs = await page.$$("input[type='text'], input[type='search']");
-    const idInput = idInputs[idInputs.length - 1];
-    if (!idInput) throw new Error("Could not find ID input on Step 2");
-    await idInput.click({ clickCount: 3 });
-    await idInput.type(driverid, { delay: 50 });
+    // Type driver ID with the same safe pattern (timeout + JS fallback)
+    const idResult = await Promise.race([
+      (async () => {
+        const idInputs = await page.$$("input[type='text'], input[type='search']");
+        const idInput = idInputs[idInputs.length - 1];
+        if (!idInput) return false;
+        await idInput.click({ clickCount: 3 });
+        await idInput.type(driverid, { delay: 30 });
+        return true;
+      })(),
+      new Promise(resolve => setTimeout(() => resolve("timeout"), 8000)),
+    ]);
+
+    if (idResult === "timeout" || idResult === false) {
+      logStep("⚠️ Driver ID input hung — using JS fallback");
+      const jsFilled = await page.evaluate((id) => {
+        const inputs = Array.from(document.querySelectorAll("input[type='text'], input[type='search'], input:not([type])"));
+        const target = inputs[inputs.length - 1];
+        if (!target) return false;
+        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeSetter.call(target, id);
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }, driverid);
+      if (!jsFilled) throw new Error("Could not find ID input on Step 2");
+    }
     await wait(250);
     await shot("4_id_entered");
 
@@ -847,6 +935,31 @@ async function waitForDropdownClosed(page, timeoutMs = 1500) {
   }, timeoutMs, 80);
 }
 
+// Fill an input field by placeholder hint — returns true on success, false if not found.
+// Uses a regular Puppeteer type() but this function should be wrapped in Promise.race
+// with a timeout by the caller, in case the DOM is weird.
+async function fillInputSafely(page, value, placeholderHints) {
+  try {
+    const hints = Array.isArray(placeholderHints) ? placeholderHints : [placeholderHints];
+    // Build selector: input[placeholder*='hint1' i], input[placeholder*='hint2' i], ...
+    const selector = hints.map(h => `input[placeholder*='${h}' i]`).join(", ");
+    let input = await page.$(selector);
+    if (!input) {
+      // Fallback: last text input on page
+      const all = await page.$$("input[type='text'], input:not([type])");
+      if (!all.length) return false;
+      input = all[all.length - 1];
+    }
+    // Quick focus + select-all + type
+    await input.click({ clickCount: 3 });
+    await input.type(value, { delay: 30 });
+    return true;
+  } catch (e) {
+    console.log(`  (fillInputSafely error: ${e.message})`);
+    return false;
+  }
+}
+
 // Click a button by visible text (case-insensitive, partial match)
 async function clickButtonText(page, textArray) {
   const list = Array.isArray(textArray) ? textArray : [textArray];
@@ -979,7 +1092,8 @@ async function selectFromDropdown(page, labelHint, optionText) {
 
   // Now find the option by its EXACT text and click it
   // Exclude options inside date/calendar widgets
-  const optionBox = await page.evaluate((txt) => {
+  // Step 1: Find the option even if it's off-screen, then scroll it into view
+  const foundOption = await page.evaluate((txt) => {
     const isDateElement = (el) => {
       if (!el || !el.className) return false;
       const cls = (el.className || "").toString().toLowerCase();
@@ -987,7 +1101,9 @@ async function selectFromDropdown(page, labelHint, optionText) {
     };
 
     const all = Array.from(document.querySelectorAll("li, [role='option'], div, span, a"));
+    let bestMatch = null;
     for (const el of all) {
+      // Skip date/calendar widgets
       let p = el;
       let skip = false;
       let depth = 0;
@@ -1001,8 +1117,45 @@ async function selectFromDropdown(page, labelHint, optionText) {
       const t = (el.textContent || "").trim();
       if (t === txt || t.toLowerCase() === txt.toLowerCase()) {
         const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && rect.top > 0) {
-          const hasText = el.children.length === 0 || Array.from(el.children).every(c => !c.textContent?.trim());
+        // Element has size (not display:none)
+        if (rect.width > 0 && rect.height > 0) {
+          const hasText = el.children.length === 0 ||
+                          Array.from(el.children).every(c => !c.textContent?.trim());
+          if (hasText || el.children.length < 2) {
+            bestMatch = el;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!bestMatch) return null;
+
+    // Scroll it into view (center) so we can click it reliably
+    bestMatch.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    return true;
+  }, optionText);
+
+  if (!foundOption) {
+    console.log(`    [dropdown] ❌ option "${optionText}" not found in list`);
+    return false;
+  }
+
+  // Give the scroll a moment to complete
+  await wait(200);
+
+  // Step 2: Now that it's in view, get its coordinates and click
+  const optionBox = await page.evaluate((txt) => {
+    const all = Array.from(document.querySelectorAll("li, [role='option'], div, span, a"));
+    for (const el of all) {
+      const t = (el.textContent || "").trim();
+      if (t === txt || t.toLowerCase() === txt.toLowerCase()) {
+        const rect = el.getBoundingClientRect();
+        // After scroll, it should be visible in viewport now
+        if (rect.width > 0 && rect.height > 0 &&
+            rect.top >= 0 && rect.bottom <= window.innerHeight) {
+          const hasText = el.children.length === 0 ||
+                          Array.from(el.children).every(c => !c.textContent?.trim());
           if (hasText || el.children.length < 2) {
             return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: t };
           }
@@ -1013,7 +1166,25 @@ async function selectFromDropdown(page, labelHint, optionText) {
   }, optionText);
 
   if (!optionBox) {
-    console.log(`    [dropdown] ❌ option "${optionText}" not visible`);
+    // Last resort: try clicking it with JS directly (less reliable for React, but fallback)
+    console.log(`    [dropdown] ⚠️ coordinate find failed after scroll, trying JS click...`);
+    const jsClicked = await page.evaluate((txt) => {
+      const all = Array.from(document.querySelectorAll("li, [role='option'], div, span, a"));
+      for (const el of all) {
+        const t = (el.textContent || "").trim();
+        if (t === txt || t.toLowerCase() === txt.toLowerCase()) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    }, optionText);
+    if (jsClicked) {
+      console.log(`    [dropdown] ✓ selected "${optionText}" (via JS fallback)`);
+      await wait(350);
+      return true;
+    }
+    console.log(`    [dropdown] ❌ option "${optionText}" could not be clicked`);
     return false;
   }
 

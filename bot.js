@@ -717,22 +717,16 @@ async function runPreset(ctx, num, passengers, testMode) {
   }, 20000); // every 20 seconds
 
   try {
-    // Hard timeout — if QR takes more than 90 seconds, abort and tell user
-    const result = await Promise.race([
-      QRGenerator.generate({
-        vehicleNumber: preset.vehicle,
-        type: preset.type,
-        port: preset.port,
-        driverid: preset.driverid,
-        passengers,
-        date: new Date().toISOString().split("T")[0],
-        debug: testMode,
-      }),
-      new Promise((_, rej) => setTimeout(() =>
-        rej(new Error("QR generation timed out after 90 seconds. Immigration site may be slow or down.")),
-        90000
-      )),
-    ]);
+    // qrGenerator has its own 60s internal timeout — no need to double-wrap
+    const result = await QRGenerator.generate({
+      vehicleNumber: preset.vehicle,
+      type: preset.type,
+      port: preset.port,
+      driverid: preset.driverid,
+      passengers,
+      date: new Date().toISOString().split("T")[0],
+      debug: testMode,
+    });
 
     clearInterval(progressInterval);
     if (progressMsgId) await ctx.telegram.deleteMessage(ctx.chat.id, progressMsgId).catch(() => {});
