@@ -121,12 +121,16 @@ async function getBrowser() {
       if (pages.length >= 0) return _browserInstance;
     } catch {
       // Browser crashed — fall through to relaunch
+      console.log("⚠️ Existing browser is dead, relaunching...");
       _browserInstance = null;
       _browserPromise = null;
     }
   }
 
-  if (_browserPromise) return _browserPromise;
+  if (_browserPromise) {
+    console.log("⏳ Browser launch already in progress, awaiting...");
+    return _browserPromise;
+  }
 
   const launchOpts = {
     headless: true,
@@ -139,16 +143,22 @@ async function getBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
     ],
+    // Hard timeout on launch — if it takes more than 30s, something is wrong
+    timeout: 30000,
   };
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    console.log(`🚀 Launching Chromium from ${launchOpts.executablePath}...`);
+  } else {
+    console.log("🚀 Launching Chromium (bundled)...");
   }
 
-  console.log("🚀 Launching Chromium (one-time startup)...");
+  const launchStart = Date.now();
   _browserPromise = puppeteer.launch(launchOpts).then(b => {
+    const elapsed = ((Date.now() - launchStart) / 1000).toFixed(1);
+    console.log(`✅ Chromium launched in ${elapsed}s`);
     _browserInstance = b;
     _browserPromise = null;
-    // If browser crashes, clear our reference so next call relaunches
     b.on("disconnected", () => {
       console.log("⚠️ Browser disconnected — will relaunch on next request");
       _browserInstance = null;
@@ -156,6 +166,8 @@ async function getBrowser() {
     });
     return b;
   }).catch(err => {
+    const elapsed = ((Date.now() - launchStart) / 1000).toFixed(1);
+    console.log(`❌ Chromium launch FAILED after ${elapsed}s: ${err.message}`);
     _browserPromise = null;
     throw err;
   });
@@ -165,12 +177,22 @@ async function getBrowser() {
 
 // Warm up the browser on module load (so first QR is fast too)
 function warmupBrowser() {
-  getBrowser().catch(err => {
+  console.log("🔥 Browser warmup triggered");
+  getBrowser().then(() => {
+    console.log("✅ Chromium ready, starting pool fill...");
+    fillPagePool();
+  }).catch(err => {
     console.log("⚠️ Browser warmup failed (will retry on first request):", err.message);
   });
-  // Also start warming the page pool
-  setTimeout(() => fillPagePool(), 2000);
 }
+
+// ⚡ AUTO-WARMUP: As soon as this module is loaded, start launching Chromium
+// and warming the page pool. This means by the time a user sends their first
+// QR request, the browser+page is already ready.
+setImmediate(() => {
+  console.log("🚀 Module loaded — auto-warming browser & page pool...");
+  warmupBrowser();
+});
 
 // ============================================================
 //  Page pool — keep 1 tab pre-navigated to the Bhutan site
@@ -271,19 +293,25 @@ async function fillPagePool() {
     while (_pagePool.length < POOL_SIZE) {
       try {
         console.log(`🏊 Warming page ${_pagePool.length + 1}/${POOL_SIZE}...`);
-        const { page, ready } = await prepareNewPage();
+        // Cap each page preparation at 40s — if the Bhutan site is slow/down,
+        // we don't want to block forever
+        const result = await Promise.race([
+          prepareNewPage(),
+          new Promise((_, rej) => setTimeout(() =>
+            rej(new Error("pool page preparation timed out after 40s")), 40000)),
+        ]);
+        const { page, ready } = result;
         if (ready) {
           _pagePool.push({ page, readyAt: Date.now() });
           console.log(`✅ Page pool: ${_pagePool.length}/${POOL_SIZE} ready`);
         } else {
           console.log("⚠️ Page didn't load properly, closing");
           await page.close().catch(() => {});
-          // Don't retry immediately — back off to avoid hammering the site
-          await wait(3000);
+          await wait(5000); // back off before retry
         }
       } catch (e) {
-        console.log(`⚠️ Pool fill error: ${e.message}`);
-        await wait(3000);
+        console.log(`⚠️ Pool fill error: ${e.message} — will retry in 5s`);
+        await wait(5000);
       }
     }
   } finally {
