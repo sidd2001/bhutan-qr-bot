@@ -504,21 +504,39 @@ async function _generateInner({ vehicleNumber, type, port, driverid, passengers 
     await wait(200);
     await shot("2_vehicle_filled");
 
+    // Before clicking Next, quickly verify step 1 is actually filled
+    // If port or type weren't selected, Next won't work and we'll hang
+    logStep("Clicking Next → Step 2...");
     await clickButtonText(page, ["Next"]);
-    // Wait for Step 2 (Driver Details) to appear instead of blind delays
-    const step2Loaded = await waitForText(page, "driver details", 8000) ||
-                        await waitForText(page, "driver id", 3000) ||
-                        await waitForText(page, "nationality", 3000);
-    if (!step2Loaded) console.log("⚠️ Step 2 may not have loaded — trying Next again");
 
-    // Sometimes the site needs a second Next click — but only if still on Step 1
-    const stillOnStep1 = await page.evaluate(() => {
-      return document.body.innerText.toLowerCase().includes("vehicle number") &&
-             !document.body.innerText.toLowerCase().includes("driver details");
-    });
-    if (stillOnStep1) {
+    // Wait for Step 2 (Driver Details) to appear — with aggressive timeout
+    // If port/type was missed, Next won't work; detect that quickly instead of hanging
+    const step2Loaded = await waitFor(page, () => {
+      const t = document.body.innerText.toLowerCase();
+      return t.includes("driver details") || t.includes("driver id") ||
+             t.includes("nationality");
+    }, 6000, 200);
+
+    if (!step2Loaded) {
+      // Didn't advance — port or vehicle type likely wasn't selected
+      // Check for validation errors
+      const hasError = await page.evaluate(() => {
+        const t = document.body.innerText.toLowerCase();
+        return t.includes("required") || t.includes("select") && t.includes("port");
+      });
+      if (hasError) {
+        throw new Error("Form validation failed — port or vehicle type not selected. Retry may help.");
+      }
+      // Try one more Next click
+      logStep("Step 2 didn't load, retrying Next...");
       await clickButtonText(page, ["Next"]);
-      await waitForText(page, "driver details", 5000);
+      const retry = await waitFor(page, () => {
+        const t = document.body.innerText.toLowerCase();
+        return t.includes("driver details") || t.includes("driver id");
+      }, 4000, 200);
+      if (!retry) {
+        throw new Error("Could not advance to Driver Details (Step 2). Form likely incomplete.");
+      }
     }
     await shot("3_step2_opened");
 
@@ -1007,7 +1025,8 @@ async function selectFromDropdown(page, labelHint, optionText) {
 
   // Now find the option by its EXACT text and click it
   // Exclude options inside date/calendar widgets
-  const optionBox = await page.evaluate((txt) => {
+  // Step 1: Find the option even if it's off-screen, then scroll it into view
+  const foundOption = await page.evaluate((txt) => {
     const isDateElement = (el) => {
       if (!el || !el.className) return false;
       const cls = (el.className || "").toString().toLowerCase();
@@ -1015,7 +1034,9 @@ async function selectFromDropdown(page, labelHint, optionText) {
     };
 
     const all = Array.from(document.querySelectorAll("li, [role='option'], div, span, a"));
+    let bestMatch = null;
     for (const el of all) {
+      // Skip date/calendar widgets
       let p = el;
       let skip = false;
       let depth = 0;
@@ -1029,8 +1050,45 @@ async function selectFromDropdown(page, labelHint, optionText) {
       const t = (el.textContent || "").trim();
       if (t === txt || t.toLowerCase() === txt.toLowerCase()) {
         const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && rect.top > 0) {
-          const hasText = el.children.length === 0 || Array.from(el.children).every(c => !c.textContent?.trim());
+        // Element has size (not display:none)
+        if (rect.width > 0 && rect.height > 0) {
+          const hasText = el.children.length === 0 ||
+                          Array.from(el.children).every(c => !c.textContent?.trim());
+          if (hasText || el.children.length < 2) {
+            bestMatch = el;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!bestMatch) return null;
+
+    // Scroll it into view (center) so we can click it reliably
+    bestMatch.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    return true;
+  }, optionText);
+
+  if (!foundOption) {
+    console.log(`    [dropdown] ❌ option "${optionText}" not found in list`);
+    return false;
+  }
+
+  // Give the scroll a moment to complete
+  await wait(200);
+
+  // Step 2: Now that it's in view, get its coordinates and click
+  const optionBox = await page.evaluate((txt) => {
+    const all = Array.from(document.querySelectorAll("li, [role='option'], div, span, a"));
+    for (const el of all) {
+      const t = (el.textContent || "").trim();
+      if (t === txt || t.toLowerCase() === txt.toLowerCase()) {
+        const rect = el.getBoundingClientRect();
+        // After scroll, it should be visible in viewport now
+        if (rect.width > 0 && rect.height > 0 &&
+            rect.top >= 0 && rect.bottom <= window.innerHeight) {
+          const hasText = el.children.length === 0 ||
+                          Array.from(el.children).every(c => !c.textContent?.trim());
           if (hasText || el.children.length < 2) {
             return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: t };
           }
@@ -1041,7 +1099,25 @@ async function selectFromDropdown(page, labelHint, optionText) {
   }, optionText);
 
   if (!optionBox) {
-    console.log(`    [dropdown] ❌ option "${optionText}" not visible`);
+    // Last resort: try clicking it with JS directly (less reliable for React, but fallback)
+    console.log(`    [dropdown] ⚠️ coordinate find failed after scroll, trying JS click...`);
+    const jsClicked = await page.evaluate((txt) => {
+      const all = Array.from(document.querySelectorAll("li, [role='option'], div, span, a"));
+      for (const el of all) {
+        const t = (el.textContent || "").trim();
+        if (t === txt || t.toLowerCase() === txt.toLowerCase()) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    }, optionText);
+    if (jsClicked) {
+      console.log(`    [dropdown] ✓ selected "${optionText}" (via JS fallback)`);
+      await wait(350);
+      return true;
+    }
+    console.log(`    [dropdown] ❌ option "${optionText}" could not be clicked`);
     return false;
   }
 
