@@ -1348,6 +1348,10 @@ bot.launch().then(() => {
   console.log("\n✅ Bhutan QR Bot (FINAL) is LIVE!");
   console.log(`💰 Price: ₹${PRICE_INR}/year | 👤 Admin: ${ADMIN_ID || "(unset)"} | 💳 UPI: ${UPI_ID || "(unset)"}\n`);
   initScheduler();
+  // Warm up the headless browser in the background so first QR is fast too
+  if (QRGenerator.warmupBrowser) {
+    QRGenerator.warmupBrowser();
+  }
 });
 
 process.once("SIGINT", () => bot.stop("SIGINT"));

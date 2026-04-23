@@ -106,10 +106,28 @@ function formatDateDDMMYYYY(d) {
 }
 
 // ============================================================
-//  Main generate function
-//  Pass { debug: true } to get step-by-step screenshots
+//  Browser pool — keep Chromium alive between QR requests
+//  Cold-starting Chromium takes 3-5s; this reuses it so every
+//  QR after the first saves that time.
 // ============================================================
-async function generate({ vehicleNumber, type, port, driverid, passengers = [], date, debug = false }) {
+let _browserPromise = null;
+let _browserInstance = null;
+
+async function getBrowser() {
+  if (_browserInstance) {
+    // Check if browser is still alive
+    try {
+      const pages = await _browserInstance.pages();
+      if (pages.length >= 0) return _browserInstance;
+    } catch {
+      // Browser crashed — fall through to relaunch
+      _browserInstance = null;
+      _browserPromise = null;
+    }
+  }
+
+  if (_browserPromise) return _browserPromise;
+
   const launchOpts = {
     headless: true,
     args: [
@@ -118,16 +136,153 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--single-process",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
     ],
   };
-  // For Railway/Render/production — use system Chromium if provided
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-  const browser = await puppeteer.launch(launchOpts);
 
+  console.log("🚀 Launching Chromium (one-time startup)...");
+  _browserPromise = puppeteer.launch(launchOpts).then(b => {
+    _browserInstance = b;
+    _browserPromise = null;
+    // If browser crashes, clear our reference so next call relaunches
+    b.on("disconnected", () => {
+      console.log("⚠️ Browser disconnected — will relaunch on next request");
+      _browserInstance = null;
+      _browserPromise = null;
+    });
+    return b;
+  }).catch(err => {
+    _browserPromise = null;
+    throw err;
+  });
+
+  return _browserPromise;
+}
+
+// Warm up the browser on module load (so first QR is fast too)
+function warmupBrowser() {
+  getBrowser().catch(err => {
+    console.log("⚠️ Browser warmup failed (will retry on first request):", err.message);
+  });
+  // Also start warming the page pool
+  setTimeout(() => fillPagePool(), 2000);
+}
+
+// ============================================================
+//  Page pool — keep 3 tabs pre-navigated to the Bhutan site
+//  so every QR request grabs a ready page instantly.
+//  After use, the page is closed and a fresh one is warmed up.
+// ============================================================
+// Pool size: can be overridden via env var. Default 3.
+// Each pooled page uses ~80-120 MB of Chromium memory.
+// On Railway $5 plan (512 MB RAM), 3 pages is safe. Set POOL_SIZE=1 for low-memory.
+const POOL_SIZE = parseInt(process.env.POOL_SIZE || "3", 10);
+const BHUTAN_URL = "https://bms.immi.gov.bt/registration/foreigner";
+const _pagePool = [];   // { page, readyAt }
+let _poolFilling = false;
+
+// Prepare a single page: open tab, navigate, wait for form, set up resource blocking
+async function prepareNewPage() {
+  const browser = await getBrowser();
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
+
+  // Block heavy resources (fonts, non-QR images) for faster loads
+  await page.setRequestInterception(true);
+  page.on("request", req => {
+    const rtype = req.resourceType();
+    const url = req.url();
+    if (rtype === "font" || rtype === "media") return req.abort();
+    if (rtype === "image" && !url.includes("qr") && !url.includes("data:image")) return req.abort();
+    req.continue();
+  });
+
+  // Navigate to Bhutan site and wait for form ready
+  await page.goto(BHUTAN_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: 30000,
+  });
+  const ready = await waitFor(page, () => {
+    const t = document.body.innerText.toLowerCase();
+    return t.includes("port of entry") || t.includes("select the port");
+  }, 15000, 150);
+
+  return { page, ready };
+}
+
+// Keep the pool full up to POOL_SIZE
+async function fillPagePool() {
+  if (_poolFilling) return;
+  _poolFilling = true;
+  try {
+    while (_pagePool.length < POOL_SIZE) {
+      try {
+        console.log(`🏊 Warming page ${_pagePool.length + 1}/${POOL_SIZE}...`);
+        const { page, ready } = await prepareNewPage();
+        if (ready) {
+          _pagePool.push({ page, readyAt: Date.now() });
+          console.log(`✅ Page pool: ${_pagePool.length}/${POOL_SIZE} ready`);
+        } else {
+          console.log("⚠️ Page didn't load properly, closing");
+          await page.close().catch(() => {});
+          // Don't retry immediately — back off to avoid hammering the site
+          await wait(3000);
+        }
+      } catch (e) {
+        console.log(`⚠️ Pool fill error: ${e.message}`);
+        await wait(3000);
+      }
+    }
+  } finally {
+    _poolFilling = false;
+  }
+}
+
+// Grab a ready page from the pool (or prepare one on-demand if empty)
+async function acquirePage() {
+  // Check if any pooled page is still valid (not too old — 5 min TTL)
+  const TTL_MS = 5 * 60 * 1000;
+  while (_pagePool.length > 0) {
+    const entry = _pagePool.shift();
+    const age = Date.now() - entry.readyAt;
+    if (age > TTL_MS) {
+      // Too old — session might have expired
+      console.log(`♻️ Discarding stale pooled page (age ${Math.round(age/1000)}s)`);
+      entry.page.close().catch(() => {});
+      continue;
+    }
+    // Verify page is still usable
+    try {
+      await entry.page.evaluate(() => document.title);
+      console.log(`⚡ Using pooled page (${_pagePool.length} still ready)`);
+      // Start refilling in background (don't await)
+      setImmediate(() => fillPagePool());
+      return entry.page;
+    } catch {
+      console.log("⚠️ Pooled page dead, discarding");
+      entry.page.close().catch(() => {});
+    }
+  }
+
+  // Pool empty — prepare a fresh page synchronously
+  console.log("⏳ Pool empty, preparing fresh page...");
+  const { page } = await prepareNewPage();
+  // Start refilling in background
+  setImmediate(() => fillPagePool());
+  return page;
+}
+
+// ============================================================
+//  Main generate function
+//  Pass { debug: true } to get step-by-step screenshots
+// ============================================================
+async function generate({ vehicleNumber, type, port, driverid, passengers = [], date, debug = false }) {
+  // Grab a pre-navigated page from the pool (instant if one is ready)
+  const page = await acquirePage();
 
   // Collect step screenshots for debug mode
   const stepScreenshots = [];
@@ -146,18 +301,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
   }
 
   try {
-    console.log("→ Opening Bhutan Immigration site...");
-    await page.goto("https://bms.immi.gov.bt/registration/foreigner", {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
-    // Wait until the port dropdown actually shows up (hydration complete)
-    const formReady = await waitFor(page, () => {
-      const txt = document.body.innerText.toLowerCase();
-      return txt.includes("port of entry") || txt.includes("select the port");
-    }, 15000, 150);
-    if (!formReady) console.log("⚠️ Form may not have loaded completely");
-
+    // Page is already navigated and form is ready — skip the load wait!
     const portName = normalizePort(port);
     const typeName = normalizeVehicleType(type);
     const todayStr = formatDateDDMMYYYY(date);
@@ -297,7 +441,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
     const pageText = (await page.evaluate(() => document.body.innerText)).toLowerCase();
     if (/not\s*registered|not\s*found|please\s*register|no\s*record|invalid/.test(pageText)) {
       console.log("✗ ID not registered");
-      await browser.close();
+      await page.close().catch(() => {});
       return { notRegistered: true, stepScreenshots };
     }
 
@@ -520,7 +664,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
       await page.screenshot({ path: qrFilePath, fullPage: false });
     }
 
-    await browser.close();
+    await page.close().catch(() => {});
     console.log(`✓ QR saved: ${qrFilePath}`);
 
     return {
@@ -541,7 +685,7 @@ async function generate({ vehicleNumber, type, port, driverid, passengers = [], 
       if (debug) stepScreenshots.push({ label: "ERROR_AT_FAILURE", path: errPath });
       console.log(`  Error screenshot: ${errPath}`);
     } catch {}
-    await browser.close();
+    await page.close().catch(() => {});
     // Throw an error that carries the screenshots with it
     const e = new Error(err.message);
     e.stepScreenshots = stepScreenshots;
@@ -789,6 +933,7 @@ async function selectFromDropdown(page, labelHint, optionText) {
 
 module.exports = {
   generate,
+  warmupBrowser,
   normalizePort,
   normalizeVehicleType,
   PORT_LIST,
